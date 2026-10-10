@@ -15,11 +15,14 @@
 
 import os
 import re
+import sys
 import time
+import base64
 import random
 import logging
 import sqlite3
 import threading
+import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -33,13 +36,25 @@ import anthropic
 
 load_dotenv()
 
-GROUP_TOKEN = os.environ["VK_GROUP_TOKEN"]
-GROUP_ID = int(os.environ["VK_GROUP_ID"])
+
+def id_list(value):
+    """'123, -456,club789' -> [123, 456, 789]: только цифры, минусы и лишние символы отбрасываем."""
+    ids = []
+    for part in (value or "").split(","):
+        digits = re.sub(r"\D", "", part)
+        if digits:
+            ids.append(int(digits))
+    return ids
+
+
+GROUP_TOKEN = os.getenv("VK_GROUP_TOKEN", "").strip()
+# Часто вписывают "-123456" или "club123456" — берём только цифры
+GROUP_ID = (id_list(os.getenv("VK_GROUP_ID", "")) or [0])[0]
 READ_TOKEN = os.getenv("VK_READ_TOKEN", "").strip()
 SHOP_NAME = os.getenv("SHOP_NAME", "наш магазин")
 MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x]
-ORDER_ALBUM_IDS = [int(x) for x in os.getenv("ORDER_ALBUM_IDS", "").replace(" ", "").split(",") if x]
+ADMIN_IDS = id_list(os.getenv("ADMIN_IDS", ""))
+ORDER_ALBUM_IDS = id_list(os.getenv("ORDER_ALBUM_IDS", ""))
 PAUSE_HOURS = float(os.getenv("PAUSE_HOURS", "12"))
 REPLY_IN_COMMENTS = os.getenv("REPLY_IN_COMMENTS", "1") == "1"
 CATALOG_REFRESH_MIN = int(os.getenv("CATALOG_REFRESH_MIN", "30"))
@@ -54,10 +69,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-group_session = vk_api.VkApi(token=GROUP_TOKEN, api_version=API_VERSION)
-vk = group_session.get_api()
-read_vk = vk_api.VkApi(token=READ_TOKEN, api_version=API_VERSION).get_api() if READ_TOKEN else None
-claude = anthropic.Anthropic()  # ключ берётся из ANTHROPIC_API_KEY
+# Клиенты создаются в init(), чтобы модуль можно было импортировать в тестах без ключей
+group_session = None
+vk = None
+read_vk = None
+claude = None
+db = None
 
 MARKET_STATUS = {
     0: "новый", 1: "согласуется", 2: "собирается", 3: "доставляется",
@@ -91,8 +108,12 @@ class DB:
             self.conn.commit()
             return cur.fetchall()
 
-
-db = DB(DB_FILE)
+    def update(self, sql, args=()):
+        """UPDATE/DELETE: возвращает число изменённых строк."""
+        with self.lock:
+            cur = self.conn.execute(sql, args)
+            self.conn.commit()
+            return cur.rowcount
 
 
 def add_history(user_id, role, content):
@@ -148,16 +169,42 @@ def format_orders(rows):
 # ---------------------------------------------------------------- каталог
 
 
+PRICE_RE = re.compile(r"(\d[\d ]{0,6})\s*(₽|руб\w*|р\.|р\b)", re.IGNORECASE)
+
+
+def parse_price(text):
+    """Цена из подписи к фото: 'Петуния 150 р.' -> '150 ₽'."""
+    m = PRICE_RE.search(text or "")
+    if not m:
+        return ""
+    return m.group(1).replace(" ", "") + " ₽"
+
+
 class Catalog:
+    MIN_REFRESH_SEC = 60   # не чаще, когда обновляемся из-за неизвестного фото
+
     def __init__(self):
         self.items = []      # все позиции для поиска и для ИИ
         self.photos = {}     # photo_id -> позиция из альбома
         self.lock = threading.Lock()
+        self.refresh_lock = threading.Lock()
+        self.last_refresh = 0.0
 
     def _api(self):
         return read_vk or vk
 
+    def refresh_if_stale(self):
+        """Обновить каталог, если давно не обновляли (для комментариев под новыми фото)."""
+        if time.time() - self.last_refresh < self.MIN_REFRESH_SEC:
+            return
+        self.refresh()
+
     def refresh(self):
+        with self.refresh_lock:
+            self.last_refresh = time.time()
+            self._refresh()
+
+    def _refresh(self):
         items, photos = [], {}
         api = self._api()
 
@@ -184,15 +231,19 @@ class Catalog:
             log.warning("Не удалось загрузить Маркет: %s", e)
 
         # Альбомы
+        album_ids = ORDER_ALBUM_IDS
+        album_titles = {}
         try:
-            album_ids = ORDER_ALBUM_IDS
-            album_titles = {}
             albums = api.photos.getAlbums(owner_id=-GROUP_ID).get("items", [])
             for a in albums:
                 album_titles[a["id"]] = a.get("title", "")
             if not album_ids:
                 album_ids = [a["id"] for a in albums]
-            for aid in album_ids:
+        except Exception as e:
+            log.warning("Не удалось получить список альбомов (нужен VK_READ_TOKEN?): %s", e)
+        for aid in album_ids:
+            # Ошибка в одном альбоме не должна ронять остальные
+            try:
                 offset = 0
                 while True:
                     r = api.photos.get(owner_id=-GROUP_ID, album_id=aid, count=1000, offset=offset)
@@ -205,7 +256,7 @@ class Catalog:
                             "album_id": aid,
                             "album": album_titles.get(aid, ""),
                             "title": title,
-                            "price": "",
+                            "price": parse_price(text),
                             "desc": text[:600],
                             "available": True,
                         }
@@ -214,8 +265,8 @@ class Catalog:
                     offset += 1000
                     if offset >= r.get("count", 0):
                         break
-        except Exception as e:
-            log.warning("Не удалось загрузить альбомы (нужен VK_READ_TOKEN?): %s", e)
+            except Exception as e:
+                log.warning("Не удалось загрузить альбом %s: %s", aid, e)
 
         with self.lock:
             if items:
@@ -393,21 +444,43 @@ def run_tool(name, args, user_id):
     return "Неизвестный инструмент."
 
 
+IMAGE_TYPES = {b"\xff\xd8\xff": "image/jpeg", b"\x89PNG": "image/png", b"GIF8": "image/gif"}
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+def image_block(url):
+    """Скачиваем фото сами и отдаём ИИ в base64: так не зависим от того, пустит ли ВК чужой сервер.
+    Если скачать не вышло — отдаём ссылку."""
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = r.read(MAX_IMAGE_BYTES + 1)
+        media = next((t for sig, t in IMAGE_TYPES.items() if data.startswith(sig)), None)
+        if media is None and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            media = "image/webp"
+        if media and len(data) <= MAX_IMAGE_BYTES:
+            return {"type": "image", "source": {
+                "type": "base64", "media_type": media, "data": base64.b64encode(data).decode()}}
+    except Exception as e:
+        log.warning("Не удалось скачать фото %s: %s", url, e)
+    return {"type": "image", "source": {"type": "url", "url": url}}
+
+
 def ask_claude(user_id, text, image_urls=(), use_history=True, max_tokens=1000):
-    content = [{"type": "image", "source": {"type": "url", "url": u}} for u in image_urls]
+    content = [image_block(u) for u in image_urls]
     content.append({"type": "text", "text": text or "(прислал фото без текста)"})
 
     messages = get_history(user_id) if use_history else []
     messages.append({"role": "user", "content": content})
     system = [{"type": "text", "text": system_prompt(), "cache_control": {"type": "ephemeral"}}]
+    extra = {"tools": TOOLS} if use_history else {}
 
     for _ in range(5):
         resp = claude.messages.create(
-            model=MODEL, max_tokens=max_tokens, system=system,
-            tools=TOOLS if use_history else [], messages=messages,
+            model=MODEL, max_tokens=max_tokens, system=system, messages=messages, **extra,
         )
         if resp.stop_reason != "tool_use":
-            return "".join(b.text for b in resp.content if b.type == "text").strip()
+            answer = "".join(b.text for b in resp.content if b.type == "text").strip()
+            return answer
         messages.append({"role": "assistant", "content": resp.content})
         results = []
         for b in resp.content:
@@ -417,7 +490,8 @@ def ask_claude(user_id, text, image_urls=(), use_history=True, max_tokens=1000):
                     "content": run_tool(b.name, b.input, user_id),
                 })
         messages.append({"role": "user", "content": results})
-    return "Секунду, уточню у менеджера."
+    log.warning("ИИ не закончил ответ за 5 шагов, пользователь %s", user_id)
+    return ""
 
 # ---------------------------------------------------------------- обработчики
 
@@ -436,17 +510,25 @@ def photo_urls(attachments):
     return urls[:4]
 
 
+def parse_user_id(arg):
+    """'123', 'id123', 'vk.com/id123' -> 123; иначе None."""
+    m = re.search(r"\d+", arg or "")
+    return int(m.group()) if m else None
+
+
 def admin_command(user_id, peer_id, text):
     parts = text.split()
     cmd = parts[0].lower()
-    if cmd == "/вкл" and len(parts) > 1:
-        uid = int(re.sub(r"\D", "", parts[1]))
-        resume_user(uid)
-        send(peer_id, f"Бот снова отвечает пользователю {uid}.", keyboard=False)
-    elif cmd == "/выкл" and len(parts) > 1:
-        uid = int(re.sub(r"\D", "", parts[1]))
-        pause_user(uid, hours=24 * 365)
-        send(peer_id, f"Бот молчит в диалоге с {uid}.", keyboard=False)
+    if cmd in ("/вкл", "/выкл"):
+        uid = parse_user_id(parts[1]) if len(parts) > 1 else None
+        if uid is None:
+            send(peer_id, f"Укажите id страницы: {cmd} 123456 или {cmd} vk.com/id123456", keyboard=False)
+        elif cmd == "/вкл":
+            resume_user(uid)
+            send(peer_id, f"Бот снова отвечает пользователю {uid}.", keyboard=False)
+        else:
+            pause_user(uid, hours=24 * 365)
+            send(peer_id, f"Бот молчит в диалоге с {uid}.", keyboard=False)
     elif cmd == "/обновить":
         catalog.refresh()
         send(peer_id, f"Каталог обновлён: {len(catalog.items)} позиций.", keyboard=False)
@@ -461,6 +543,10 @@ def admin_command(user_id, peer_id, text):
                 f"vk.com/id{u} — {i} × {q or '?'} ({s}, {src})" for u, i, q, s, src in rows), keyboard=False)
     else:
         send(peer_id, "Команды: /вкл id, /выкл id, /обновить, /заказы", keyboard=False)
+
+
+def has_voice(attachments):
+    return any(a.get("type") == "audio_message" for a in attachments or [])
 
 
 def on_message(msg):
@@ -492,65 +578,116 @@ def on_message(msg):
 
         images = photo_urls(msg.get("attachments"))
         if not text and not images:
+            if has_voice(msg.get("attachments")):
+                send(peer_id, "Голосовые я пока не слушаю 🙈 Напишите, пожалуйста, текстом "
+                              "или нажмите «Позвать менеджера».")
             return
         try:
             answer = ask_claude(user_id, text, images)
         except Exception:
             log.exception("Ошибка ИИ")
-            answer = "Что-то пошло не так, передал вопрос менеджеру."
-            call_manager(user_id, f"ошибка бота, вопрос: {text[:200]}")
+            answer = ""
+        if not answer:
+            answer = "Не смог сразу ответить, передал вопрос менеджеру. Он напишет здесь."
+            call_manager(user_id, f"бот не смог ответить, вопрос: {text[:200] or '[фото]'}")
 
         add_history(user_id, "user", (text or "") + (" [фото]" if images else ""))
         add_history(user_id, "assistant", answer)
         send(peer_id, answer)
 
 
-ORDER_RE = re.compile(
-    r"(^\s*\+|\bбер[уёе]|\bвозьм|\bзаказ|\bброн|\bхочу|\bмне\b|"
-    r"^\s*\d+\s*$|\d+\s*(шт|штук|куст|уп|пак|пачк|горш|сем))")
-CANCEL_RE = re.compile(r"\bотмен|\bне\s+буду|\bпередумал")
+# --- разбор комментариев под фото
+#
+# Заказ: «+», «беру 2», «возьму пару», «бронь», «закажу», «2 шт», просто «3», «мне тоже».
+# «Хочу»/«мне» считаем заказом только с количеством («хочу 2», «мне 3 шт»),
+# иначе «хочу узнать цену» или «мне кажется…» превращались в заказы.
+# Вопрос («сколько стоит 1 шт?», «бронь есть?») — не заказ, если в нём нет явного «+», «беру» или «возьму».
 
+CANCEL_RE = re.compile(r"\bотмен|\bне\s+буду\b|\bпередумал|\bуже\s+не\s+надо\b")
+STRONG_ORDER_RE = re.compile(r"^\s*\+|\bбер(у|ём|ем)\b|\bвозьм(у|ём|ем)\b")
+ORDER_WORDS_RE = re.compile(
+    r"\bброн|\bзакаж(у|ем)\b|\bзаказываю\b|\bмне\s+(тоже|так\s*же)\b|^\s*и\s+мне\b")
+QTY_RE = re.compile(r"\d+\s*(шт|штук|куст|уп|пак|пачк|горш|сем)|^\s*\d+\s*(шт\w*)?\s*[.!)]*\s*$")
+WEAK_ORDER_RE = re.compile(r"\bхочу\b|\bмне\b|\bнужн[оаы]?\b")
 
 WORD_NUMS = {"одн": 1, "один": 1, "два": 2, "две": 2, "три": 3, "четыр": 4, "пят": 5,
              "шест": 6, "семь": 7, "восем": 8, "девят": 9, "десят": 10, "пару": 2, "пара": 2}
+
+
+def word_qty(text):
+    for word in re.findall(r"[а-яё]+", text):
+        if "дцат" in word:   # «пятнадцать», «двадцать» — не угадываем, пусть уточнит менеджер
+            continue
+        for stem, n in WORD_NUMS.items():
+            if word == stem or (len(stem) >= 3 and word.startswith(stem)):
+                return n
+    return None
 
 
 def parse_qty(text):
     m = re.search(r"\d+", text)
     if m and 0 < int(m.group()) <= 1000:
         return int(m.group())
-    for word in re.findall(r"[а-яё]+", text):
-        for stem, n in WORD_NUMS.items():
-            if word == stem or (len(stem) >= 3 and word.startswith(stem)):
-                return n
-    return 1
+    return word_qty(text.lower()) or 1
+
+
+def classify_comment(text):
+    """'cancel', 'order', 'question' или None (обычный комментарий)."""
+    low = (text or "").lower().strip()
+    if not low:
+        return None
+    if CANCEL_RE.search(low):
+        return "cancel"
+    question = "?" in low
+    if STRONG_ORDER_RE.search(low):
+        return "order"
+    if not question:
+        if ORDER_WORDS_RE.search(low) or QTY_RE.search(low):
+            return "order"
+        if WEAK_ORDER_RE.search(low) and (re.search(r"\d", low) or word_qty(low)):
+            return "order"
+    return "question" if question else None
+
+
+def album_ext_prefix(photo_id):
+    # "_" в LIKE означает «любой символ», поэтому экранируем: иначе photo12_% задевал бы photo123_…
+    return f"photo{photo_id}\\_c%"
 
 
 def on_photo_comment(obj):
     user_id = obj.get("from_id", 0)
-    if user_id <= 0:
+    if user_id <= 0 or user_id in ADMIN_IDS:   # сообщество и админы заказы не оформляют
+        return
+    owner = obj.get("photo_owner_id")
+    if owner is not None and owner != -GROUP_ID:
         return
     photo_id = obj["photo_id"]
     comment_id = obj["id"]
     text = (obj.get("text") or "").strip()
-    low = text.lower()
+    kind = classify_comment(text)
+    if kind is None:
+        return
 
     item = catalog.photos.get(photo_id)
-    if item is None and catalog.items:
-        catalog.refresh()
+    if item is None:
+        catalog.refresh_if_stale()   # фото могли добавить после последнего обновления
         item = catalog.photos.get(photo_id)
-    if ORDER_ALBUM_IDS and item and item["album_id"] not in ORDER_ALBUM_IDS:
-        return
+    if ORDER_ALBUM_IDS and (item is None or item["album_id"] not in ORDER_ALBUM_IDS):
+        return   # фото не из альбомов с заказами
     title = item["title"] if item else f"фото {photo_id}"
     link = f"https://vk.com/photo-{GROUP_ID}_{photo_id}"
 
-    if CANCEL_RE.search(low):
-        db.run("UPDATE orders SET status='отменён' WHERE user_id=? AND ext_id LIKE ? AND status='новый'",
-               (user_id, f"photo{photo_id}_%"))
+    if kind == "cancel":
+        n = db.update(
+            "UPDATE orders SET status='отменён' "
+            "WHERE user_id=? AND ext_id LIKE ? ESCAPE '\\' AND status='новый'",
+            (user_id, album_ext_prefix(photo_id)))
+        if not n:
+            return   # отменять нечего — не дёргаем админов
         notify_admins(f"❌ Отмена в альбоме\n{title}\nОт: vk.com/id{user_id}\n{link}")
         reply_comment(photo_id, comment_id, "Отменили 👌")
-    elif ORDER_RE.search(low):
-        qty = parse_qty(low)
+    elif kind == "order":
+        qty = parse_qty(text.lower())
         try:
             db.run("INSERT INTO orders(source,user_id,item,qty,comment,ext_id,ts) VALUES (?,?,?,?,?,?,?)",
                    ("album", user_id, title, qty, text, f"photo{photo_id}_c{comment_id}", int(time.time())))
@@ -559,7 +696,7 @@ def on_photo_comment(obj):
         notify_admins(f"🛒 Заказ в альбоме\n{title} × {qty}\nКомментарий: {text}\n"
                       f"От: vk.com/id{user_id}\n{link}")
         reply_comment(photo_id, comment_id, f"Записали: {title} × {qty} 🌱")
-    elif REPLY_IN_COMMENTS and read_vk and "?" in text:
+    elif REPLY_IN_COMMENTS and read_vk:
         try:
             answer = ask_claude(
                 user_id,
@@ -567,7 +704,8 @@ def on_photo_comment(obj):
                 f"{item['desc'] if item else 'нет'}\nВопрос: {text}\n"
                 f"Ответь в 1–3 предложениях.",
                 use_history=False, max_tokens=300)
-            reply_comment(photo_id, comment_id, answer)
+            if answer:
+                reply_comment(photo_id, comment_id, answer)
         except Exception:
             log.exception("Ошибка ответа в комментарии")
 
@@ -599,7 +737,7 @@ def on_market_order(obj, new):
                    ("market", user_id, f"Заказ №{oid}: {items}", None, total,
                     f"market{obj.get('id')}", status, int(time.time())))
         except sqlite3.IntegrityError:
-            pass
+            return   # это событие уже обработали
         notify_admins(f"🛒 Новый заказ в Маркете №{oid}\n{items}\nСумма: {total}\nОт: vk.com/id{user_id}")
     else:
         db.run("UPDATE orders SET status=? WHERE ext_id=?", (status, f"market{obj.get('id')}"))
@@ -632,7 +770,30 @@ def dispatch(raw):
         log.exception("Ошибка обработки события %s", etype)
 
 
+def init():
+    """Проверить настройки и создать клиентов ВК, ИИ и базу."""
+    global group_session, vk, read_vk, claude, db
+    missing = [name for name, ok in (
+        ("VK_GROUP_TOKEN", GROUP_TOKEN),
+        ("VK_GROUP_ID", GROUP_ID),
+        ("ANTHROPIC_API_KEY", os.getenv("ANTHROPIC_API_KEY", "").strip()),
+    ) if not ok]
+    if missing:
+        sys.exit("Не заполнены настройки в .env: " + ", ".join(missing))
+    if not ADMIN_IDS:
+        log.warning("ADMIN_IDS пуст: уведомления о заказах и вызовах менеджера никто не получит")
+    if not READ_TOKEN:
+        log.warning("VK_READ_TOKEN пуст: бот не увидит альбомы и не ответит в комментариях")
+
+    group_session = vk_api.VkApi(token=GROUP_TOKEN, api_version=API_VERSION)
+    vk = group_session.get_api()
+    read_vk = vk_api.VkApi(token=READ_TOKEN, api_version=API_VERSION).get_api() if READ_TOKEN else None
+    claude = anthropic.Anthropic()  # ключ берётся из ANTHROPIC_API_KEY
+    db = DB(DB_FILE)
+
+
 def main():
+    init()
     threading.Thread(target=catalog_loop, daemon=True).start()
     pool = ThreadPoolExecutor(max_workers=4)
     log.info("Бот запущен для группы %s, модель %s", GROUP_ID, MODEL)
@@ -641,6 +802,12 @@ def main():
             longpoll = VkBotLongPoll(group_session, GROUP_ID)
             for event in longpoll.listen():
                 pool.submit(dispatch, event.raw)
+        except vk_api.exceptions.ApiError as e:
+            if e.code == 5:
+                sys.exit("ВК не принял VK_GROUP_TOKEN: проверь ключ сообщества в .env")
+            log.error("Ошибка ВК при подключении к Long Poll: %s. Проверь, что Long Poll API включён "
+                      "и у ключа есть нужные права (README, раздел 1). Повтор через 30 секунд", e)
+            time.sleep(30)
         except Exception:
             log.exception("Long Poll упал, переподключаюсь через 5 секунд")
             time.sleep(5)
